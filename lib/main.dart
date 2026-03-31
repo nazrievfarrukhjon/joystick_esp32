@@ -1,6 +1,7 @@
 import 'dart:async';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
@@ -167,7 +168,6 @@ class _ControllerScreenState extends State<ControllerScreen> {
   final Connectivity _connectivity = Connectivity();
 
   StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
-  Timer? _reconnectTimer;
   Timer? _statusTimer;
   Timer? _driveTimer;
 
@@ -183,6 +183,9 @@ class _ControllerScreenState extends State<ControllerScreen> {
   double _speed = 0.8;
   int _sequenceStep = 0;
 
+  bool get _supportsWifiControl =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.android;
+
   @override
   void initState() {
     super.initState();
@@ -195,18 +198,26 @@ class _ControllerScreenState extends State<ControllerScreen> {
     _connectivitySubscription = _connectivity.onConnectivityChanged.listen((_) {
       unawaited(_refreshConnectionStatus());
     });
-    _reconnectTimer = Timer.periodic(
-      const Duration(seconds: 8),
-      (_) => unawaited(_attemptWifiReconnect()),
-    );
     _statusTimer = Timer.periodic(
       const Duration(seconds: 4),
       (_) => unawaited(_refreshConnectionStatus()),
     );
-    await _attemptWifiReconnect();
   }
 
   Future<void> _requestPermissions() async {
+    if (!_supportsWifiControl) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _permissionsReady = true;
+        _panelStatus = 'DESKTOP PREVIEW';
+        _wifiText = 'MACOS PREVIEW';
+        _showNotice('DESKTOP PREVIEW', NoticeTone.neutral);
+      });
+      return;
+    }
+
     final List<Permission> permissions = [Permission.locationWhenInUse];
     if (await Permission.nearbyWifiDevices.isGranted ||
         await Permission.nearbyWifiDevices.isDenied) {
@@ -238,6 +249,19 @@ class _ControllerScreenState extends State<ControllerScreen> {
   }
 
   Future<void> _refreshConnectionStatus() async {
+    if (!_supportsWifiControl) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _isEspReachable = false;
+        _wifiText = 'MACOS PREVIEW';
+        _panelStatus = 'DESKTOP PREVIEW';
+        _showNotice('ANDROID WIFI ONLY', NoticeTone.neutral);
+      });
+      return;
+    }
+
     final String rawSsid = await WiFiForIoTPlugin.getSSID() ?? 'NOT CONNECTED';
     final String wifiName = _normalizeSsid(rawSsid).isEmpty
         ? 'NOT CONNECTED'
@@ -270,6 +294,17 @@ class _ControllerScreenState extends State<ControllerScreen> {
   }
 
   Future<void> _attemptWifiReconnect() async {
+    if (!_supportsWifiControl) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _panelStatus = 'DESKTOP PREVIEW';
+        _showNotice('RECONNECT ON ANDROID', NoticeTone.warning);
+      });
+      return;
+    }
+
     if (!_permissionsReady || _connectingWifi) {
       return;
     }
@@ -284,8 +319,8 @@ class _ControllerScreenState extends State<ControllerScreen> {
 
     setState(() {
       _connectingWifi = true;
-      _panelStatus = 'AUTO RECONNECTING';
-      _showNotice('SEARCHING WIFI', NoticeTone.neutral);
+      _panelStatus = 'MANUAL RECONNECT';
+      _showNotice('TRYING TO CONNECT', NoticeTone.neutral);
     });
 
     try {
@@ -411,7 +446,6 @@ class _ControllerScreenState extends State<ControllerScreen> {
   @override
   void dispose() {
     _connectivitySubscription?.cancel();
-    _reconnectTimer?.cancel();
     _statusTimer?.cancel();
     _driveTimer?.cancel();
     _ssidController.dispose();
@@ -439,7 +473,7 @@ class _ControllerScreenState extends State<ControllerScreen> {
                 Row(
                   children: [
                     Expanded(
-                      flex: 6,
+                      flex: 5,
                       child: Center(
                         child: JoystickPad(
                           onCommandChanged: _sendCommand,
@@ -510,19 +544,18 @@ class JoystickPad extends StatefulWidget {
 }
 
 class _JoystickPadState extends State<JoystickPad> {
-  static const double _padSize = 320;
-  static const double _knobSize = 140;
-  static const double _maxOffset = 54;
+  static const double _maxPadSize = 250;
+  static const double _minPadSize = 200;
   static const double _deadZone = 18;
 
   Offset _knobOffset = Offset.zero;
 
-  void _updateFromLocalPosition(Offset localPosition) {
-    final Offset centered =
-        localPosition - const Offset(_padSize / 2, _padSize / 2);
+  void _updateFromLocalPosition(Offset localPosition, double padSize) {
+    final double maxOffset = padSize * 0.17;
+    final Offset centered = localPosition - Offset(padSize / 2, padSize / 2);
     final double distance = centered.distance;
-    final Offset limited = distance > _maxOffset
-        ? centered / distance * _maxOffset
+    final Offset limited = distance > maxOffset
+        ? centered / distance * maxOffset
         : centered;
 
     setState(() {
@@ -570,54 +603,89 @@ class _JoystickPadState extends State<JoystickPad> {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      mainAxisAlignment: MainAxisAlignment.center,
-      children: [
-        Text(
-          'ESP32 CONTROL PAD',
-          style: Theme.of(
-            context,
-          ).textTheme.headlineMedium?.copyWith(color: const Color(0xFFF4F4F4)),
-        ),
-        const SizedBox(height: 18),
-        GestureDetector(
-          onPanStart: (details) =>
-              _updateFromLocalPosition(details.localPosition),
-          onPanUpdate: (details) =>
-              _updateFromLocalPosition(details.localPosition),
-          onPanEnd: (_) => _resetJoystick(),
-          onPanCancel: _resetJoystick,
-          child: SizedBox(
-            width: _padSize,
-            height: _padSize,
-            child: Stack(
-              alignment: Alignment.center,
-              children: [
-                CustomPaint(
-                  size: const Size(_padSize, _padSize),
-                  painter: _SegaPadBasePainter(),
-                ),
-                AnimatedPositioned(
-                  duration: const Duration(milliseconds: 45),
-                  left: (_padSize - _knobSize) / 2 + _knobOffset.dx,
-                  top: (_padSize - _knobSize) / 2 + _knobOffset.dy,
-                  child: CustomPaint(
-                    size: const Size(_knobSize, _knobSize),
-                    painter: _DPadKnobPainter(),
-                  ),
-                ),
-              ],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final double padSize = (constraints.maxHeight - 78).clamp(
+          _minPadSize,
+          _maxPadSize,
+        );
+        final double crossSize = padSize * 0.46;
+        final double nubSize = padSize * 0.12;
+
+        return Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              'ESP32 CONTROL PAD',
+              style: Theme.of(context).textTheme.headlineMedium?.copyWith(
+                color: const Color(0xFFF4F4F4),
+                fontSize: 24,
+              ),
             ),
-          ),
-        ),
-        const SizedBox(height: 16),
-        Text(
-          'CURRENT: ${widget.activeCommand.label}',
-          style: Theme.of(
-            context,
-          ).textTheme.titleLarge?.copyWith(color: const Color(0xFFE5E5E5)),
-        ),
-      ],
+            const SizedBox(height: 10),
+            GestureDetector(
+              onPanStart: (details) =>
+                  _updateFromLocalPosition(details.localPosition, padSize),
+              onPanUpdate: (details) =>
+                  _updateFromLocalPosition(details.localPosition, padSize),
+              onPanEnd: (_) => _resetJoystick(),
+              onPanCancel: _resetJoystick,
+              child: SizedBox(
+                width: padSize,
+                height: padSize,
+                child: Stack(
+                  alignment: Alignment.center,
+                  children: [
+                    CustomPaint(
+                      size: Size(padSize, padSize),
+                      painter: _SegaPadBasePainter(),
+                    ),
+                    CustomPaint(
+                      size: Size(crossSize, crossSize),
+                      painter: _DPadKnobPainter(),
+                    ),
+                    AnimatedPositioned(
+                      duration: const Duration(milliseconds: 45),
+                      left: (padSize - nubSize) / 2 + _knobOffset.dx,
+                      top: (padSize - nubSize) / 2 + _knobOffset.dy,
+                      child: Container(
+                        width: nubSize,
+                        height: nubSize,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          gradient: const RadialGradient(
+                            colors: [Color(0xFF434343), Color(0xFF0A0A0A)],
+                          ),
+                          border: Border.all(
+                            color: const Color(0xFF717171),
+                            width: 1.4,
+                          ),
+                          boxShadow: const [
+                            BoxShadow(
+                              color: Color(0xBB000000),
+                              blurRadius: 8,
+                              offset: Offset(0, 4),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+            const SizedBox(height: 10),
+            Text(
+              'CURRENT: ${widget.activeCommand.label}',
+              style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                color: const Color(0xFFE5E5E5),
+                fontSize: 16,
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 }
@@ -925,8 +993,8 @@ class _SegaPadBasePainter extends CustomPainter {
       ..shader = const RadialGradient(
         colors: [Color(0xFF111111), Color(0xFF000000)],
         radius: 0.82,
-      ).createShader(Rect.fromCircle(center: center, radius: size.width / 2.6));
-    canvas.drawCircle(center, size.width / 2.8, bowl);
+      ).createShader(Rect.fromCircle(center: center, radius: size.width / 3.0));
+    canvas.drawCircle(center, size.width / 3.25, bowl);
 
     final Paint gloss = Paint()
       ..shader = const LinearGradient(
@@ -962,8 +1030,8 @@ class _DPadKnobPainter extends CustomPainter {
         RRect.fromRectAndRadius(
           Rect.fromCenter(
             center: Offset(size.width / 2, size.height / 2),
-            width: size.width * 0.34,
-            height: size.height * 0.92,
+            width: size.width * 0.24,
+            height: size.height * 1.34,
           ),
           const Radius.circular(18),
         ),
@@ -972,8 +1040,8 @@ class _DPadKnobPainter extends CustomPainter {
         RRect.fromRectAndRadius(
           Rect.fromCenter(
             center: Offset(size.width / 2, size.height / 2),
-            width: size.width * 0.92,
-            height: size.height * 0.34,
+            width: size.width * 1.34,
+            height: size.height * 0.24,
           ),
           const Radius.circular(18),
         ),
@@ -987,22 +1055,6 @@ class _DPadKnobPainter extends CustomPainter {
       ..strokeWidth = 2
       ..color = const Color(0xAA7F7F7F);
     canvas.drawPath(cross, border);
-
-    final Paint centerPaint = Paint()
-      ..shader =
-          const RadialGradient(
-            colors: [Color(0xFF2C2C2C), Color(0xFF080808)],
-          ).createShader(
-            Rect.fromCircle(
-              center: Offset(size.width / 2, size.height / 2),
-              radius: size.width * 0.14,
-            ),
-          );
-    canvas.drawCircle(
-      Offset(size.width / 2, size.height / 2),
-      size.width * 0.12,
-      centerPaint,
-    );
   }
 
   @override
